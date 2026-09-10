@@ -36,48 +36,148 @@ def find_last_conv_layer(model) -> str:
     return model.layers[-2].name if len(model.layers) > 2 else model.layers[-1].name
 
 
+def _torch_modules(model):
+    """Best-effort iterator over underlying torch nn.Modules (Keras-3 torch backend)."""
+    import torch.nn as nn
+
+    seen = set()
+
+    def _walk(obj):
+        oid = id(obj)
+        if oid in seen:
+            return
+        seen.add(oid)
+        if isinstance(obj, nn.Module):
+            yield obj
+            for child in obj.children():
+                yield from _walk(child)
+            return
+        for attr in ("torch_module", "_torch_module", "module", "_module"):
+            sub = getattr(obj, attr, None)
+            if sub is not None and id(sub) != oid:
+                yield from _walk(sub)
+        for child in getattr(obj, "layers", []) or []:
+            yield from _walk(child)
+
+    yield from _walk(model)
+
+
+def _find_last_conv2d(model):
+    """Find the last torch Conv2d module for hook-based Grad-CAM."""
+    import torch.nn as nn
+
+    last = None
+    for mod in _torch_modules(model):
+        for child in mod.modules():
+            if isinstance(child, nn.Conv2d):
+                last = child
+    return last
+
+
+def _activation_heatmap(activations: np.ndarray) -> np.ndarray:
+    """Class-agnostic attention signal: mean |activation| over channels."""
+    heat = np.mean(np.abs(activations), axis=0)
+    span = heat.max() - heat.min()
+    if span > 1e-8:
+        heat = (heat - heat.min()) / span
+    else:
+        heat = np.zeros_like(heat)
+    return heat.astype(np.float32)
 def compute_gradcam(
     model,
     image: np.ndarray,
     predicted_class: int,
     last_conv_layer_name: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute Grad-CAM heatmap for a given image and prediction."""
+    """Compute Grad-CAM heatmap for a given image and prediction.
+
+    Strategy (Keras 3 / PyTorch backend):
+    1. True Grad-CAM via a forward hook on the last torch Conv2d + backward()
+       of the predicted-class score w.r.t. those feature maps.
+    2. Fallback: class-agnostic activation heatmap (mean |activation|) from the
+       same layer — still a genuine model-attention signal, never synthetic.
+    Raises RuntimeError only if neither path is possible.
+    """
     img_h, img_w = image.shape[1], image.shape[2]
+
+    def _finish(heat_hw: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        heat = np.clip(heat_hw, 0, None).astype(np.float32)
+        mx = heat.max()
+        heat = heat / mx if mx > 1e-8 else np.zeros_like(heat)
+        return heat, cv2.resize(heat, (img_w, img_h)).astype(np.float32)
 
     try:
         import torch
-        import keras
-        if last_conv_layer_name is None:
-            last_conv_layer_name = find_last_conv_layer(model)
 
-        # Grad-CAM with Keras 3 / PyTorch backend
-        grad_model = keras.Model(
-            inputs=model.input,
-            outputs=[model.get_layer(last_conv_layer_name).output, model.output],
-        )
+        conv = _find_last_conv2d(model)
+        if conv is None:
+            raise RuntimeError("no Conv2d module found")
 
-        image_tensor = torch.tensor(image, dtype=torch.float32, requires_grad=True)
-        conv_outputs, predictions = grad_model(image_tensor)
-        loss = predictions[:, predicted_class]
-        loss.backward()
+        captured = {}
 
-        grads = image_tensor.grad
-        if grads is not None:
-            pooled_grads = torch.mean(grads, dim=(0, 2, 3))
-            conv_out = conv_outputs[0]
-            heatmap = torch.sum(conv_out * pooled_grads.view(-1, 1, 1), dim=0)
-            heatmap = torch.relu(heatmap)
-            max_v = torch.max(heatmap)
-            if max_v > 0:
-                heatmap = heatmap / max_v
-            heatmap_raw = heatmap.detach().cpu().numpy()
-        else:
-            heatmap_raw = np.mean(np.abs(conv_outputs.detach().cpu().numpy()[0]), axis=-1)
-            heatmap_raw = (heatmap_raw - heatmap_raw.min()) / (heatmap_raw.max() - heatmap_raw.min() + 1e-8)
+        def _fwd_hook(_mod, _inp, out):
+            captured["act"] = out
 
-        heatmap_resized = cv2.resize(heatmap_raw, (img_w, img_h))
-        return heatmap_raw, heatmap_resized
+        handle = conv.register_forward_hook(_fwd_hook)
+        try:
+            was_training = bool(getattr(model, "training", False))
+            if hasattr(model, "eval"):
+                try:
+                    model.eval()
+                except Exception:
+                    pass
+            heat_hw = None
+            last_err = None
+            # Try channels-last (matches the numpy layout) then channels-first.
+            for layout in ("last", "first"):
+                try:
+                    if layout == "last":
+                        t = torch.tensor(image, dtype=torch.float32)
+                    else:
+                        t = torch.tensor(image, dtype=torch.float32).permute(0, 3, 1, 2)
+                    captured.pop("act", None)
+                    out = model(t)
+                    preds = out[0] if isinstance(out, (list, tuple)) else out
+                    score = preds[0, predicted_class]
+                    model.zero_grad(set_to_none=True)
+                    score.backward()
+                    act = captured.get("act", None)
+                    if act is None:
+                        raise RuntimeError("hook captured nothing")
+                    grad = act.grad
+                    if grad is None:
+                        raise RuntimeError("no gradient on conv maps")
+                    weights = grad.detach().mean(dim=(0, 2, 3))
+                    heat = (act.detach()[0] * weights.view(-1, 1, 1)).sum(dim=0)
+                    heat = torch.relu(heat).cpu().numpy()
+                    heat_hw = heat
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    continue
+            if heat_hw is not None:
+                return _finish(heat_hw)
+            # Gradient path failed but the hook may still have activations.
+            act = captured.get("act", None)
+            if act is not None:
+                a = act.detach().cpu().numpy()
+                a = a[0].transpose(1, 2, 0) if a.ndim == 4 else a
+                if a.ndim == 3:
+                    return _finish(_activation_heatmap(a.transpose(2, 0, 1)))
+            raise RuntimeError(f"gradient path failed: {last_err}")
+        finally:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+            if was_training and hasattr(model, "train"):
+                try:
+                    model.train()
+                except Exception:
+                    pass
+    except RuntimeError as e:
+        raise RuntimeError(f"Grad-CAM generation failed: {e}") from e
     except Exception as e:
         raise RuntimeError(f"Grad-CAM generation failed: {e}") from e
 
