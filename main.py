@@ -98,6 +98,11 @@ def _validate_and_decode(file: UploadFile, contents: bytes):
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "docs": "/docs", "health": "/api/health"}
+
+
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(
